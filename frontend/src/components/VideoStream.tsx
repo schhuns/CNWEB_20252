@@ -1,8 +1,8 @@
 "use client";
 
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from "react";
 
-type ConnectionStatus = 'disconnected' | 'connecting' | 'connected';
+type ConnectionStatus = "disconnected" | "connecting" | "connected";
 
 interface VideoStreamProps {
   cameraId: string;
@@ -12,174 +12,182 @@ export default function VideoStream({ cameraId }: VideoStreamProps) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  const [isStreaming, setIsStreaming] = useState(false);
-  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
-  const animationFrameId = useRef<number | null>(null);
 
+  const streamRef = useRef<MediaStream | null>(null);
+  const runningRef = useRef(false);
+
+  const [status, setStatus] = useState<ConnectionStatus>("disconnected");
+
+  // ---------------- CAMERA ----------------
   const startCamera = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { width: 640, height: 480 },
         audio: false,
       });
+
+      streamRef.current = stream;
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        videoRef.current.play();
-        setIsStreaming(true);
-        connectWebSocket();
+        await videoRef.current.play();
       }
+
+      runningRef.current = true;
+
+      connectWebSocket();
     } catch (err) {
-      console.error("Error accessing camera:", err);
-      alert("Could not access camera. Please allow permissions.");
+      console.error("Camera error:", err);
+      alert("Cannot access camera. Please allow permission.");
     }
   };
 
   const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      const tracks = stream.getTracks();
-      tracks.forEach((track) => track.stop());
+    runningRef.current = false;
+
+    // stop camera
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+
+    if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
-    setIsStreaming(false);
-    
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
-    
-    if (animationFrameId.current) {
-      cancelAnimationFrame(animationFrameId.current);
-    }
-    
-    // Clear canvas
-    if (canvasRef.current) {
-      const ctx = canvasRef.current.getContext('2d');
-      if (ctx) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
-    }
-    setStatus('disconnected');
+
+    // close websocket
+    wsRef.current?.close();
+    wsRef.current = null;
+
+    // clear canvas
+    const ctx = canvasRef.current?.getContext("2d");
+    if (ctx) ctx.clearRect(0, 0, 640, 480);
+
+    setStatus("disconnected");
   };
 
+  // ---------------- WEBSOCKET ----------------
   const connectWebSocket = () => {
-    setStatus('connecting');
-    // Connect to FastAPI backend
-    const ws = new WebSocket('ws://localhost:8000/ws/stream');
-    
+    setStatus("connecting");
+
+    const ws = new WebSocket("ws://localhost:8000/ws/stream");
+
+    wsRef.current = ws;
+
     ws.onopen = () => {
-      setStatus('connected');
-      console.log('WebSocket connected');
-      // Start sending frames
-      sendFrameLoop();
+      console.log("WebSocket connected");
+      setStatus("connected");
+      sendFrames();
     };
 
     ws.onmessage = (event) => {
-      // Received processed frame with AI bounding boxes
-      const imageSrc = event.data;
-      if (canvasRef.current) {
-        const ctx = canvasRef.current.getContext('2d');
-        if (ctx) {
-          const img = new Image();
-          img.onload = () => {
-            ctx.drawImage(img, 0, 0, canvasRef.current!.width, canvasRef.current!.height);
-          };
-          img.src = imageSrc;
-        }
-      }
+      const img = new Image();
+
+      img.onload = () => {
+        const ctx = canvasRef.current?.getContext("2d");
+        if (!ctx) return;
+
+        ctx.drawImage(img, 0, 0, 640, 480);
+      };
+
+      img.src = event.data;
+    };
+
+    ws.onerror = (e) => {
+      console.error("WebSocket error:", e);
     };
 
     ws.onclose = () => {
-      setStatus('disconnected');
-      console.log('WebSocket disconnected');
-      if (isStreaming) {
-        // Simple reconnect after 3 seconds
-        setTimeout(() => connectWebSocket(), 3000);
+      console.log("WebSocket closed");
+      setStatus("disconnected");
+
+      if (runningRef.current) {
+        setTimeout(connectWebSocket, 2000);
       }
     };
-
-    ws.onerror = (error) => {
-      console.error('WebSocket error:', error);
-    };
-
-    wsRef.current = ws;
   };
 
-  const sendFrameLoop = useCallback(() => {
-    if (!videoRef.current || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-      return;
-    }
-
-    // Use a temporary canvas to get the base64 encoded frame
-    const tempCanvas = document.createElement('canvas');
-    tempCanvas.width = 640;
-    tempCanvas.height = 480;
-    const ctx = tempCanvas.getContext('2d');
-    
-    if (ctx && videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
-      ctx.drawImage(videoRef.current, 0, 0, tempCanvas.width, tempCanvas.height);
-      // Get base64 string
-      const base64Data = tempCanvas.toDataURL('image/jpeg', 0.6); // Quality 0.6 to balance lag and clarity
-      
-      // Send to backend
-      wsRef.current.send(base64Data);
-    }
-
-    // Send around ~15-20 frames per second to avoid overloading
-    setTimeout(() => {
-      if (isStreaming) {
-        animationFrameId.current = requestAnimationFrame(sendFrameLoop);
+  // ---------------- FRAME LOOP (FIXED) ----------------
+  const sendFrames = useCallback(() => {
+    const loop = () => {
+      if (
+        !runningRef.current ||
+        !wsRef.current ||
+        wsRef.current.readyState !== WebSocket.OPEN ||
+        !videoRef.current
+      ) {
+        return;
       }
-    }, 50); 
-  }, [isStreaming]);
 
-  // Clean up on unmount
-  useEffect(() => {
-    return () => {
-      stopCamera();
+      const video = videoRef.current;
+
+      if (video.readyState >= 2) {
+        const canvas = document.createElement("canvas");
+        canvas.width = 640;
+        canvas.height = 480;
+
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.drawImage(video, 0, 0, 640, 480);
+
+          const frame = canvas.toDataURL("image/jpeg", 0.6);
+          wsRef.current?.send(frame);
+        }
+      }
+
+      setTimeout(loop, 60); // ~15 FPS
     };
+
+    loop();
+  }, []);
+
+  // ---------------- CLEANUP ----------------
+  useEffect(() => {
+    return () => stopCamera();
   }, []);
 
   return (
     <div className="stream-container">
       <div className="video-wrapper">
-        {/* Hidden video element to capture webcam */}
-        <video ref={videoRef} playsInline muted style={{ display: 'none' }} />
-        
-        {/* Canvas displaying the AI processed frame from backend */}
-        <canvas 
-          ref={canvasRef} 
-          width={640} 
+        {/* CAMERA FEED (hidden but active) */}
+        <video
+          ref={videoRef}
+          playsInline
+          muted
+          style={{ display: "none" }}
+        />
+
+        {/* AI OUTPUT */}
+        <canvas
+          ref={canvasRef}
+          width={640}
           height={480}
-          style={{ 
-            display: 'block', 
-            backgroundColor: isStreaming ? '#000' : 'transparent',
-            opacity: isStreaming ? 1 : 0,
-            transition: 'opacity 0.3s'
+          style={{
+            display: "block",
+            background: "#000",
           }}
         />
 
-        {!isStreaming && (
-          <div className="camera-placeholder">
-            CAMERA OFFLINE
-          </div>
+        {status === "disconnected" && (
+          <div className="camera-placeholder">CAMERA OFFLINE</div>
         )}
-        
-        <div className={`connection-status status-${status}`}>
-          <div className="status-dot"></div>
-          {status === 'connected' ? 'LIVE - AI ACTIVE' : status === 'connecting' ? 'CONNECTING...' : 'OFFLINE'}
+
+        <div className="connection-status">
+          {status === "connected"
+            ? "LIVE AI"
+            : status === "connecting"
+            ? "CONNECTING..."
+            : "OFFLINE"}
         </div>
-        
+
         <div className="camera-label">{cameraId}</div>
       </div>
-      
+
       <div className="controls">
-        {!isStreaming ? (
-          <button className="btn btn-primary" onClick={startCamera}>
-            Enable AI Camera
-          </button>
+        {runningRef.current ? (
+          <button onClick={stopCamera}>Stop</button>
         ) : (
-          <button className="btn btn-danger" onClick={stopCamera}>
-            Stop Stream
-          </button>
+          <button onClick={startCamera}>Enable AI Camera</button>
         )}
       </div>
     </div>
